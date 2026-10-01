@@ -20,7 +20,7 @@ from urllib.parse import unquote
 SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
 SAFE_SCHEMES = {'http', 'https', 'mailto', 'ftp', 'data'}
 
-STRIP_TAGS_RE = re.compile(r'(?is)<(script|style|noscript|template).*?</\1\s*>')
+# 仅保留清理 HTML 注释的正则，废弃危险的 script/style 正则
 COMMENT_RE = re.compile(r'(?s)<!--.*?-->')
 
 HEAD_TAGS = ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')
@@ -35,6 +35,9 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 BACKTICK = chr(96)
+
+# 需要完全忽略的 HTML 标签（包括其内部文本）
+IGNORE_TAGS = {'script', 'style', 'noscript', 'template', 'head', 'title', 'meta', 'link'}
 
 
 # ==============================
@@ -60,10 +63,8 @@ def sanitize_path_segment(segment: str) -> str:
     segment = ''.join('_' if c in BAD_CHARS else c for c in segment)
     segment = segment.rstrip('. ')
     
-    if not segment:
-        return '_'
-    if segment in ('.', '..'):
-        return '_'
+    if not segment: return '_'
+    if segment in ('.', '..'): return '_'
     
     base = segment.split('.', 1)[0]
     if base.upper() in WINDOWS_RESERVED_NAMES:
@@ -141,11 +142,10 @@ def escape_leading_block_chars(text: str) -> str:
     text = re.sub(r'^(=+)\s*$', r'\\\1', text)
     return text
 
-def clean_html_fragment(html_fragment: str) -> str:
+def clean_html_comments(html_fragment: str) -> str:
+    """仅清理 HTML 注释，不再使用正则清理 script/style，交由 Parser 状态机处理"""
     if not html_fragment: return ''
-    html_fragment = STRIP_TAGS_RE.sub('', html_fragment)
-    html_fragment = COMMENT_RE.sub('', html_fragment)
-    return html_fragment
+    return COMMENT_RE.sub('', html_fragment)
 
 def decode_html_bytes(data: bytes) -> str:
     if data.startswith(b'\xef\xbb\xbf'):
@@ -198,6 +198,24 @@ def fix_zip_entry_name(name: str) -> str:
         except UnicodeDecodeError: pass
     return name
 
+def extract_body_html(html_content: str) -> str:
+    """
+    多重 Fallback 提取正文 HTML：
+    1. 标准 <body>
+    2. <html> 内剔除 <head>
+    3. 全量返回（依赖 Parser 过滤）
+    """
+    m = re.search(r'<body[^>]*>(.*?)</body>', html_content, re.DOTALL | re.IGNORECASE)
+    if m: return m.group(1)
+    
+    m = re.search(r'<html[^>]*>(.*?)</html>', html_content, re.DOTALL | re.IGNORECASE)
+    if m:
+        content = m.group(1)
+        content = re.sub(r'(?is)<head[^>]*>.*?</head>', '', content)
+        return content
+        
+    return html_content
+
 
 # ==============================
 # HTML -> Markdown 解析器
@@ -208,6 +226,10 @@ class HTMLToMarkdown(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.attachment_prefix = attachment_prefix
         self.result = []
+        
+        # 核心修复：使用状态机栈忽略 script/style/head，彻底杜绝正则误杀正文
+        self._ignore_stack = [] 
+        
         self.list_stack = []
         self.list_counters = []
         self.container_stack = []
@@ -241,26 +263,21 @@ class HTMLToMarkdown(HTMLParser):
                 return
 
     def _start_line_with_prefix(self, prefix: str):
-        """让后续内容从“换行 + 指定前缀”开始。优化了首行无前导换行的问题。"""
         if not self.result:
             self.result.append(prefix)
             return
-        
         last = self.result[-1]
         if last.endswith('\n' + prefix): return
-        
         if last.endswith('\n'):
             self.result[-1] = last + prefix
         else:
             self.result.append('\n' + prefix)
 
     def _append_block_newline(self):
-        """块级换行。在容器内生成带前缀的空行，避免 blockquote 被无 > 的空行切断。"""
         prefix = self._block_prefix()
         if not self.result:
             self.result.append('\n' + prefix)
             return
-        
         last = self.result[-1]
         if self.container_stack:
             target = '\n' + prefix
@@ -277,7 +294,6 @@ class HTMLToMarkdown(HTMLParser):
                 self.result.append('\n\n')
 
     def _append_smart_space(self):
-        """智能追加空格，防止嵌套表格降级时产生连续多个空格。"""
         if not self.result:
             self.result.append(' ')
             return
@@ -343,6 +359,13 @@ class HTMLToMarkdown(HTMLParser):
         self._block_boundary = self._after_li_marker = self._li_just_closed = False
 
     def handle_starttag(self, tag, attrs):
+        # 核心修复：状态机忽略 script/style/head 等标签，防止正则误杀
+        if tag in IGNORE_TAGS:
+            self._ignore_stack.append(tag)
+            return
+        if self._ignore_stack:
+            return
+
         attrs_dict = dict(attrs)
         if self._in_pre:
             if tag == 'br': self._pre_parts.append('\n')
@@ -354,7 +377,6 @@ class HTMLToMarkdown(HTMLParser):
             if tag == 'br': self._inline_code_parts.append(' ')
             return
 
-        # 嵌套表格：抑制结构标签，智能追加空格，放行文本
         if self._suppressed_table_depth > 0:
             if tag == 'table': self._suppressed_table_depth += 1
             elif tag in ('tr', 'td', 'th', 'br'): self._append_smart_space()
@@ -365,7 +387,6 @@ class HTMLToMarkdown(HTMLParser):
             self._append_smart_space()
             return
 
-        # 表格单元格内的块级结构降级为智能空格
         if self._table_stack and (tag in ('p', 'div', 'ul', 'ol', 'li', 'blockquote', 'pre', 'hr') or tag in HEAD_TAGS):
             self._append_smart_space()
             return
@@ -377,41 +398,28 @@ class HTMLToMarkdown(HTMLParser):
             self._after_li_marker = False
 
         if tag == 'div':
-            if self.list_stack and self._after_li_marker: 
-                self._after_li_marker = False
-            elif self.list_stack: 
-                # 列表内的 div 使用轻量换行，避免产生被误认为缩进代码块的异常空行
-                self._start_line_with_prefix(self._block_prefix())
-            else: 
-                self._append_block_newline()
-                
+            if self.list_stack and self._after_li_marker: self._after_li_marker = False
+            elif self.list_stack: self._start_line_with_prefix(self._block_prefix())
+            else: self._append_block_newline()
         elif tag == 'br':
             self.result.append(' ' if self._table_stack else '\n' + self._block_prefix())
-            
         elif tag == 'p':
             if self.list_stack and self._after_li_marker: self._after_li_marker = False
             else: self._append_block_newline()
-            
         elif tag in HEAD_TAGS:
             self._append_block_newline()
             self.result.append('#' * int(tag[1]) + ' ')
-            
         elif tag in ('strong', 'b'):
             self._bold_count += 1
             self.result.append('**')
-            
         elif tag in ('em', 'i'):
             self._em_count += 1
             self.result.append('*')
-            
         elif tag == 'code':
             self._in_inline_code, self._inline_code_parts, self._after_li_marker = True, [], False
-            
         elif tag == 'blockquote':
             self.container_stack.append('quote')
-            # 进入容器后使用 start_line，避免产生首行空 > 
             self._start_line_with_prefix(self._block_prefix())
-            
         elif tag == 'a':
             if self._pending_href is not None: self._close_pending_link()
             href = re.sub(r'\s+', ' ', attrs_dict.get('href') or '').strip()
@@ -420,68 +428,59 @@ class HTMLToMarkdown(HTMLParser):
                 self.result.append('[')
                 self._pending_href = href
             else: self._pending_href = None
-            
         elif tag == 'img':
             src = sanitize_local_src(attrs_dict.get('src') or '', self.attachment_prefix)
             alt = escape_markdown_text(re.sub(r'\s+', ' ', attrs_dict.get('alt') or '').strip())
             if self._table_stack: alt = alt.replace('|', '\\|')
             self.result.append(f'![{alt}]({markdown_destination(src)})')
             self._block_boundary = self._after_li_marker = self._li_just_closed = False
-            
         elif tag in ('ul', 'ol'):
             self._after_li_marker = False
-            # 简化冗余条件
-            if self.list_stack:
-                self._start_line_with_prefix(self._block_prefix())
-            else:
-                self._append_block_newline()
-                
+            if self.list_stack: self._start_line_with_prefix(self._block_prefix())
+            else: self._append_block_newline()
             self.list_stack.append(tag)
             self.list_counters.append(0 if tag == 'ol' else None)
             self.container_stack.append('list')
-            
         elif tag == 'li':
             self._li_just_closed = False
             prefix = self._marker_prefix()
             self._start_line_with_prefix(prefix)
-            
             if self.list_stack and self.list_stack[-1] == 'ol':
                 self.list_counters[-1] = (self.list_counters[-1] or 0) + 1
                 marker = f'{self.list_counters[-1]}. '
             else: marker = '- '
             self.result.append(marker)
             self._after_li_marker = True
-            
         elif tag == 'hr':
             self._append_block_newline()
             self.result.append('***\n' + self._block_prefix())
-            
         elif tag == 'pre':
             self._in_pre, self._pre_parts, self._pre_language = True, [], ''
             m = re.search(r'language-([\w+.\-]+)', attrs_dict.get('class') or '')
             if m: self._pre_language = m.group(1)
-            
         elif tag == 'table':
             self._after_li_marker = False
-            if self.list_stack:
-                self._start_line_with_prefix(self._block_prefix())
-            else:
-                self._append_block_newline()
+            if self.list_stack: self._start_line_with_prefix(self._block_prefix())
+            else: self._append_block_newline()
             self._table_stack.append({'header_done': False, 'cell_count': 0, 'in_row': False})
-            
         elif tag == 'tr':
             if self._table_stack:
                 self._table_stack[-1]['cell_count'] = 0
                 self._table_stack[-1]['in_row'] = True
                 self._start_line_with_prefix(self._block_prefix())
                 self.result.append('|')
-                
         elif tag in ('td', 'th'):
             if self._table_stack and self._table_stack[-1]['in_row']:
                 self._table_stack[-1]['cell_count'] += 1
                 self.result.append(' ')
 
     def handle_endtag(self, tag):
+        # 核心修复：状态机出栈
+        if self._ignore_stack:
+            if self._ignore_stack[-1] == tag:
+                self._ignore_stack.pop()
+            return
+
         if self._in_pre:
             if tag == 'pre': self._flush_pre()
             return
@@ -500,46 +499,35 @@ class HTMLToMarkdown(HTMLParser):
         if tag in HEAD_TAGS or tag == 'p' or tag == 'div':
             self.result.append('\n')
             self._block_boundary = True
-            
         elif tag in ('strong', 'b'):
             if self._bold_count > 0:
                 self._bold_count -= 1
                 self._append_closing_marker('**')
-                
         elif tag in ('em', 'i'):
             if self._em_count > 0:
                 self._em_count -= 1
                 self._append_closing_marker('*')
-                
         elif tag == 'a':
             self._close_pending_link()
-            
         elif tag == 'li':
             self.result.append('\n')
             self._li_just_closed, self._after_li_marker, self._block_boundary = True, False, True
-            
         elif tag in ('ul', 'ol'):
             if self.list_stack: self.list_stack.pop()
             if self.list_counters: self.list_counters.pop()
             self._pop_container('list')
             self._after_li_marker, self._li_just_closed = False, False
-            
-            if self.list_stack:
-                self._start_line_with_prefix(self._block_prefix())
-            else:
-                self._append_block_newline()
+            if self.list_stack: self._start_line_with_prefix(self._block_prefix())
+            else: self._append_block_newline()
             self._block_boundary = True
-            
         elif tag == 'blockquote':
             self._pop_container('quote')
             self._append_block_newline()
             self._block_boundary = True
-            
         elif tag in ('td', 'th'):
             if self._table_stack and self._table_stack[-1]['in_row']:
                 self.result.append(' |')
             self._block_boundary = True
-            
         elif tag == 'tr':
             if self._table_stack:
                 current = self._table_stack[-1]
@@ -548,7 +536,6 @@ class HTMLToMarkdown(HTMLParser):
                     current['header_done'] = True
                 current['in_row'] = False
             self._block_boundary = True
-            
         elif tag == 'table':
             if self._table_stack: self._table_stack.pop()
             if not self._table_stack: self._suppressed_table_depth = 0
@@ -556,7 +543,10 @@ class HTMLToMarkdown(HTMLParser):
             self._block_boundary = True
 
     def handle_data(self, data):
+        # 核心修复：忽略区域内的文本直接丢弃
+        if self._ignore_stack: return
         if not data: return
+        
         if self._in_pre:
             self._pre_parts.append(data)
             return
@@ -607,8 +597,6 @@ class HTMLToMarkdown(HTMLParser):
         result = ''.join(self.result).replace('\r\n', '\n').replace('\r', '\n')
         result = re.sub(r'[ \t]+\n', '\n', result)
         result = re.sub(r'\n{3,}', '\n\n', result)
-        
-        # 清理夹在换行之间的孤立空引用行 (如 \n> \n\n 变成 \n\n)
         result = re.sub(r'\n[ \t]*(?:>[ \t]*)+\n(?=\n)', '\n', result)
 
         lines = result.split('\n')
@@ -644,17 +632,18 @@ def extract_metadata(html_content: str, ziw_path: str) -> dict:
                 metadata['created'] = dm.group(0)
                 break
 
-    body_match = re.search(r'<body[^>]*>(.*?)</body>', html_content, re.DOTALL | re.IGNORECASE)
-    if body_match:
-        text_content = html.unescape(re.sub(r'<[^>]+>', '\n', clean_html_fragment(body_match.group(1)))).replace('\xa0', ' ')
-        for line in text_content.split('\n'):
-            line = re.sub(r'\s+', ' ', line).strip()
-            if not line: continue
-            if not metadata['title']: metadata['title'] = line[:100]
-            if not metadata['created']:
-                dm = re.search(r'\d{4}-\d{2}-\d{2}', line)
-                if dm: metadata['created'] = dm.group(0)
-            break
+    # 使用增强的 Fallback 提取正文用于 metadata 兜底
+    body_html = extract_body_html(html_content)
+    text_content = html.unescape(re.sub(r'<[^>]+>', '\n', body_html)).replace('\xa0', ' ')
+    
+    for line in text_content.split('\n'):
+        line = re.sub(r'\s+', ' ', line).strip()
+        if not line: continue
+        if not metadata['title']: metadata['title'] = line[:100]
+        if not metadata['created']:
+            dm = re.search(r'\d{4}-\d{2}-\d{2}', line)
+            if dm: metadata['created'] = dm.group(0)
+        break
 
     if not metadata['title']: metadata['title'] = get_note_name(ziw_path)
     try: metadata['modified'] = datetime.fromtimestamp(os.path.getmtime(ziw_path)).strftime('%Y-%m-%d %H:%M:%S')
@@ -673,7 +662,7 @@ def process_ziw_file(ziw_path: str, output_base_dir: str, source_base_dir: str):
                 return None, False
 
             html_content = decode_html_bytes(zf.read(index_name))
-            cleaned_html = clean_html_fragment(html_content)
+            cleaned_html = clean_html_comments(html_content)
             metadata = extract_metadata(cleaned_html, ziw_path)
 
             rel_path = os.path.relpath(ziw_path, start=source_base_dir)
@@ -683,8 +672,9 @@ def process_ziw_file(ziw_path: str, output_base_dir: str, source_base_dir: str):
 
             att_dir_name = make_attachment_dir_name(output_path.stem, identity=output_rel)
 
-            body_match = re.search(r'<body[^>]*>(.*?)</body>', cleaned_html, re.DOTALL | re.IGNORECASE)
-            markdown_content = convert_html_to_markdown(body_match.group(1), attachment_prefix=att_dir_name) if body_match else ''
+            # 使用多重 Fallback 提取正文 HTML
+            body_html = extract_body_html(cleaned_html)
+            markdown_content = convert_html_to_markdown(body_html, attachment_prefix=att_dir_name)
 
             meta_lines = [
                 '---',
